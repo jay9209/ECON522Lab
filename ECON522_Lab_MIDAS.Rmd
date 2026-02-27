@@ -1,0 +1,554 @@
+---
+title: 'ECON 522 — Lab: Mixed Data Sampling (MIDAS)'
+author: "Forecasting and Macroeconomic Analytics"
+date: "Spring 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    number_sections: true
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5)
+```
+
+# Introduction
+
+So far in this course we have worked with data at a **single frequency** — for example, monthly inflation or quarterly GDP. But many important predictors are measured at a **different, higher frequency** than the variable we want to forecast.
+
+**Examples of frequency mismatches:**
+
+| Low-Frequency Target  | High-Frequency Predictor |
+|-----------------------|--------------------------|
+| Quarterly GDP growth  | Daily stock returns      |
+| Monthly inflation     | Weekly commodity prices  |
+| Quarterly consumption | Monthly retail sales     |
+
+This lab introduces **MIDAS (Mixed Data Sampling)** regression — a principled way to use all available high-frequency information when forecasting a low-frequency variable. We will use **real data** throughout: quarterly U.S. real GDP growth from the Federal Reserve (FRED) and daily S&P 500 returns from Yahoo Finance.
+
+## What You Will Learn
+
+1.  Why frequency mismatches are a problem and why simple aggregation loses information
+2.  The MIDAS regression model and its weighting schemes
+3.  How to download and align real data across frequencies
+4.  How to estimate MIDAS models in R using the `midasr` package
+5.  How to generate and evaluate MIDAS forecasts against a benchmark
+
+------------------------------------------------------------------------
+
+# Setup
+
+## Required Packages
+
+```{r packages}
+# Install if needed (run once):
+# install.packages("midasr")
+# install.packages("quantmod")
+# install.packages("forecast")
+# install.packages("ggplot2")
+# install.packages("dplyr")
+# install.packages("lubridate")
+# install.packages("zoo")
+
+library(midasr)     # MIDAS estimation
+library(quantmod)   # Download data from FRED and Yahoo Finance
+library(forecast)   # AR benchmark models
+library(ggplot2)    # Plotting
+library(dplyr)      # Data manipulation
+library(lubridate)  # Date handling
+library(zoo)        # Time series alignment
+```
+
+------------------------------------------------------------------------
+
+# The Frequency Mismatch Problem
+
+## The Setup
+
+We want to forecast **quarterly U.S. real GDP growth** using **daily S&P 500 returns**.
+
+Each quarter contains approximately **63 trading days** (we will compute the exact number per quarter from the data). This creates an immediate challenge:
+
+-   For every **1 observation** of GDP growth, we have **\~63 observations** of stock returns
+-   How do we use all of that daily information without losing it?
+
+## Why Simple Aggregation Falls Short
+
+The most natural fix is to average the 63 daily returns into a single quarterly return and use that as our predictor. But this has a hidden cost.
+
+Stock returns contain **timing information**: was it the returns from the first week of the quarter, the last week, or the middle that were most informative for GDP? When we average everything together, we implicitly assume all days are equally informative — but that may not be true.
+
+**MIDAS lets the data tell us which days matter most.**
+
+------------------------------------------------------------------------
+
+# Downloading the Data
+
+## GDP Growth from FRED
+
+We download **Real Gross Domestic Product** (`GDPC1`) from FRED. This is quarterly, seasonally adjusted, in billions of chained 2017 dollars. We convert it to a **quarter-over-quarter log growth rate** (annualized).
+
+```{r download_gdp}
+# Download real GDP from FRED
+# getSymbols() stores the result in your environment with the ticker name
+getSymbols("GDPC1", src = "FRED")
+
+# GDPC1 is now an xts object in your environment
+# Compute annualized quarter-over-quarter log growth rate (in percent)
+gdp_growth_xts <- 400 * diff(log(GDPC1))  # 400 = annualize * convert to %
+gdp_growth_xts <- na.omit(gdp_growth_xts)
+
+# Restrict to 2000 Q1 onwards for a clean sample
+gdp_growth_xts <- gdp_growth_xts["2000/"]
+
+head(gdp_growth_xts, 8)
+```
+
+> **What does `400 * diff(log(GDPC1))` mean?**
+>
+> `diff(log(GDPC1))` gives the log change from one quarter to the next, which approximates the quarter-over-quarter growth rate. Multiplying by 400 annualizes it (×4) and converts to percentage points (×100). This is the standard transformation used by the Federal Reserve and most macroeconomic research.
+
+```{r plot_gdp}
+gdp_df <- data.frame(
+  date   = as.Date(index(gdp_growth_xts)),
+  growth = as.numeric(gdp_growth_xts)
+)
+
+ggplot(gdp_df, aes(x = date, y = growth)) +
+  geom_line(color = "steelblue", linewidth = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  annotate("text", x = as.Date("2008-06-01"), y = -35,
+           label = "GFC", size = 3, color = "gray40") +
+  annotate("text", x = as.Date("2020-02-01"), y = -35,
+           label = "COVID", size = 3, color = "gray40") +
+  labs(title = "U.S. Real GDP Growth (Annualized, %)",
+       subtitle = "Quarterly, 2000 Q1 – present | Shaded = NBER recessions",
+       x = NULL, y = "QoQ Growth Rate (annualized %)") +
+  theme_minimal(base_size = 13)
+```
+
+## S&P 500 Daily Returns from Yahoo Finance
+
+We download the S&P 500 index (`^GSPC`) from Yahoo Finance and compute daily log returns.
+
+```{r download_sp500}
+# Download S&P 500 daily prices from Yahoo Finance
+getSymbols("^GSPC", src = "yahoo", from = "1999-01-01", to = "2025-12-31")
+
+# Compute daily log returns (in percent)
+sp500_returns <- 100 * diff(log(Cl(GSPC)))  # Cl() extracts closing prices
+sp500_returns <- na.omit(sp500_returns)
+sp500_returns <- sp500_returns["2000/"]      # match GDP sample start
+
+cat("S&P 500 daily returns summary:\n")
+summary(as.numeric(sp500_returns))
+cat(sprintf("\nTotal daily observations: %d\n", nrow(sp500_returns)))
+```
+
+```{r plot_sp500}
+sp_df <- data.frame(
+  date   = as.Date(index(sp500_returns)),
+  return = as.numeric(sp500_returns)
+)
+
+ggplot(sp_df, aes(x = date, y = return)) +
+  geom_line(color = "firebrick", linewidth = 0.3, alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(title = "S&P 500 Daily Log Returns (%)",
+       subtitle = "2000 – present",
+       x = NULL, y = "Daily Return (%)") +
+  theme_minimal(base_size = 13)
+```
+
+------------------------------------------------------------------------
+
+# Aligning the Data for MIDAS
+
+## The Key Challenge
+
+MIDAS requires us to carefully align the **quarterly** GDP observations with the **daily** S&P 500 returns. Specifically, for each quarter $t$, we need a vector of all daily returns that occurred *within* (or just before) that quarter.
+
+There are two distinct forecasting scenarios:
+
+-   **Nowcasting / same-quarter:** Use returns from the *current* quarter to predict the same quarter's GDP (before the official release)
+-   **One-quarter-ahead:** Use returns from the *previous* quarter to predict next quarter's GDP
+
+We will focus on the **one-quarter-ahead** case, which is cleaner for a standard out-of-sample exercise.
+
+```{r align_data}
+# Step 1: Get the quarterly dates from GDP
+gdp_dates  <- as.Date(index(gdp_growth_xts))
+gdp_values <- as.numeric(gdp_growth_xts)
+n_quarters <- length(gdp_values)
+
+cat(sprintf("Number of quarters: %d\n", n_quarters))
+cat(sprintf("Sample: %s to %s\n", gdp_dates[1], gdp_dates[n_quarters]))
+```
+
+```{r build_hf_matrix}
+# Step 2: For each quarter, extract the daily returns from that quarter
+# We use a fixed window of m = 62 trading days per quarter
+# If a quarter has more days, we take the last 62; if fewer, we pad with NAs
+
+m <- 62  # fixed high-frequency window length
+
+# Build a matrix: rows = quarters, columns = daily lags
+# Column 1 = most recent day of the quarter (lag 1)
+# Column m = earliest day included (lag m)
+X_hf <- c()
+
+for (t in 1:n_quarters) {
+  q_start   <- gdp_dates[t]
+  q_end     <- gdp_dates[t] + months(3) - days(1)
+  q_returns <- sp500_returns[paste0(q_start, "/", q_end)]
+
+  if (length(q_returns) == 0) {
+    # No data for this quarter — pad with m zeros to keep alignment
+    q_vec <- rep(0, m)
+  } else {
+    q_vec <- as.numeric(q_returns)
+    # If fewer than m trading days, left-pad with zeros
+    if (length(q_vec) < m) {
+      q_vec <- c(rep(0, m - length(q_vec)), q_vec)
+    } else {
+      # If more than m, keep only the last m days
+      q_vec <- tail(q_vec, m)
+    }
+  }
+
+  # Append in chronological order (oldest first)
+  # Do NOT reverse — mls() expects oldest-to-most-recent
+  X_hf <- c(X_hf, q_vec)
+}
+```
+
+------------------------------------------------------------------------
+
+# The MIDAS Model
+
+## Mathematical Foundation
+
+The MIDAS regression model for our application is:
+
+$$\text{GDP}_t = \beta_0 + \beta_1 \sum_{k=1}^{63} w(k;\,\theta)\, r_{t,k} + \varepsilon_t$$
+
+Where:
+
+-   $\text{GDP}_t$ = annualized quarterly GDP growth rate
+-   $r_{t,k}$ = S&P 500 daily return on day $k$ of quarter $t$ (lag 1 = most recent day)
+-   $w(k;\,\theta)$ = **weight function** that sums to 1 and is non-negative
+-   $\beta_0$ = intercept
+-   $\beta_1$ = overall scale of the stock-market effect on GDP
+-   $\theta = (\theta_1, \theta_2)$ = hyperparameters controlling the shape of the weights
+
+The weighted sum $\sum_k w(k;\theta)\, r_{t,k}$ is like a **customized, optimally-weighted average** of the daily returns — where the data decides which days get the most weight.
+
+## Exponential Almon Weighting
+
+We use the most common weighting scheme:
+
+$$w(k;\,\theta_1, \theta_2) = \frac{\exp(\theta_1 k + \theta_2 k^2)}{\sum_{j=1}^{K} \exp(\theta_1 j + \theta_2 j^2)}$$
+
+| Parameter values | Weight shape |
+|------------------------------------|------------------------------------|
+| $\theta_1 < 0,\; \theta_2 = 0$ | Exponential decay — most recent days dominate |
+| $\theta_1 > 0,\; \theta_2 < 0$ | Hump shape — mid-quarter days peak |
+| $\theta_1 = \theta_2 = 0$ | Equal weights — same as simple quarterly average |
+
+
+------------------------------------------------------------------------
+
+# Estimating MIDAS in R with `midasr`
+
+## Key `midasr` Functions
+
+| Function                       | Purpose                                    |
+|------------------------------------|------------------------------------|
+| `mls(x, lags, m)`              | Create a matrix of mixed-frequency lags    |
+| `midas_r(formula, start, ...)` | Estimate MIDAS via nonlinear least squares |
+| `nealmon(p, d)`                | Exponential Almon weight function          |
+| `nbeta(p, d)`                  | Beta weight function                       |
+
+## Estimating with Exponential Almon Weights
+
+```{r estimate_almon}
+# midas_r() uses a special formula syntax:
+#   mls(X_hf, 1:m, 1, nealmon)
+#     - X_hf:   the high-frequency lag matrix (rows=quarters, cols=daily lags)
+#     - 1:m:    use lags 1 through m
+#     - 1:      frequency ratio (already handled since X_hf is pre-built)
+#     - nealmon: use Exponential Almon weighting
+#
+# start = list(X_hf = c(theta1_init, theta2_init))
+#   We start at c(0, 0) which corresponds to equal weights (flat prior)
+
+midas_almon <- midas_r(
+  gdp_values ~ mls(X_hf, 1:m, 62, nealmon),
+  start = list(X_hf = c(0, 0, 0))
+)
+
+summary(midas_almon)
+```
+
+### Interpreting the Output
+
+```{r interpret_almon}
+params <- coef(midas_almon)
+cat("=== Estimated Parameters ===\n\n")
+cat(sprintf("Intercept (β₀):       %8.4f\n",   params["(Intercept)"]))
+cat(sprintf("Overall slope (β₁):   %8.4f\n",   params["X_hf1"]))
+cat(sprintf("Shape param (θ₁):     %8.4f\n",   params["X_hf2"]))
+cat(sprintf("Shape param (θ₂):     %8.4f\n\n", params["X_hf3"]))
+
+cat("=== Economic Interpretation ===\n\n")
+cat(sprintf("β₁ = %.4f\n", params["X_hf1"]))
+cat("  The overall slope is positive — consistent with the well-known\n")
+cat("  leading-indicator property of equity markets for GDP growth.\n\n")
+
+theta1_est <- params["X_hf2"]
+theta2_est <- params["X_hf3"]
+if (theta1_est < 0) {
+  cat("θ₁ < 0: Weights decline with lag length.\n")
+  cat("  → Recent trading days (end of quarter) are more informative about GDP.\n")
+} else {
+  cat("θ₁ > 0: Weights increase with lag length.\n")
+  cat("  → Earlier trading days (beginning of quarter) are more informative.\n")
+}
+if (theta2_est < 0) {
+  cat("θ₂ < 0: Combined with θ₁, this creates a hump-shaped weight pattern.\n")
+}
+```
+
+### Visualizing the Estimated Weights
+
+```{r plot_estimated_weights}
+theta_est       <- params[c("X_hf2", "X_hf3")]
+estimated_w     <- nealmon(theta_est, m)
+
+df_est_w <- data.frame(lag = 1:m, weight = estimated_w)
+
+ggplot(df_est_w, aes(x = lag, y = weight)) +
+  geom_line(color = "firebrick", linewidth = 1.3) +
+  geom_area(fill = "firebrick", alpha = 0.2) +
+  labs(
+    title = "Estimated MIDAS Weights (Exponential Almon)",
+    subtitle = sprintf("θ̂₁ = %.4f, θ̂₂ = %.4f | Lag 1 = end of quarter, Lag62 = start",
+                       theta_est[1], theta_est[2]),
+    x = "Lag (trading days within quarter, 1 = most recent)",
+    y = "Weight"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+> **What does this tell us?** The estimated weight pattern reveals how daily stock returns are optimally combined to forecast GDP. If recent lags receive higher weight, stock market movements at the **end** of the quarter are most informative. If earlier lags dominate, it may be that early-quarter stock market signals matter more for aggregate economic activity.
+
+## Estimating with Beta Weights
+
+```{r estimate_beta}
+# Beta weighting scheme — an alternative functional form
+# nbeta() takes 3 starting values: (a, b, scalar)
+midas_beta <- midas_r(
+  gdp_values ~ mls(X_hf, 1:m, 62, nbeta),
+  start = list(X_hf = c(1, 5, 1))
+)
+
+summary(midas_beta)
+```
+
+```{r compare_weights_plot}
+theta_beta <- coef(midas_beta)[2:4]
+beta_w     <- nbeta(theta_beta, m)
+
+df_compare <- bind_rows(
+  data.frame(lag = 1:m, weight = estimated_w, scheme = "Exponential Almon"),
+  data.frame(lag = 1:m, weight = beta_w,      scheme = "Beta")
+)
+
+ggplot(df_compare, aes(x = lag, y = weight, color = scheme)) +
+  geom_line(linewidth = 1.2) +
+  scale_color_manual(values = c("Exponential Almon" = "firebrick",
+                                "Beta"              = "steelblue")) +
+  labs(title = "Estimated Weights: Exponential Almon vs. Beta",
+       x = "Lag (trading days)", y = "Weight", color = "Scheme") +
+  theme_minimal(base_size = 13)
+```
+
+## Adding an Autoregressive Term: ADL-MIDAS
+
+GDP growth is **autocorrelated** — a strong quarter tends to follow a strong quarter (with some mean reversion). We can improve the model by including one lag of GDP growth:
+
+$$\text{GDP}_t = \beta_0 + \alpha \cdot \text{GDP}_{t-1} + \beta_1 \sum_{k=1}^{63} w(k;\,\theta)\, r_{t,k} + \varepsilon_t$$
+
+```{r adl_midas}
+# Create lag of GDP and align (drop first observation)
+gdp_lag1      <- c(NA, gdp_values[-n_quarters])
+idx_adl       <- !is.na(gdp_lag1)
+
+y_adl         <- gdp_values[idx_adl]
+gdp_lag1_adl  <- gdp_lag1[idx_adl]
+X_hf_adl      <- X_hf[idx_adl]
+dates_adl     <- gdp_dates[idx_adl]
+
+midas_adl <- midas_r(
+  y_adl ~ gdp_lag1_adl + mls(X_hf_adl, 1:m, 62, nealmon),
+  start = list(X_hf_adl = c(0, 0, 0))
+)
+
+summary(midas_adl)
+```
+
+```{r model_aic}
+cat("=== Model Comparison (AIC — lower is better) ===\n\n")
+cat(sprintf("MIDAS — Exponential Almon:  %.2f\n", AIC(midas_almon)))
+cat(sprintf("MIDAS — Beta:               %.2f\n", AIC(midas_beta)))
+cat(sprintf("ADL-MIDAS:                  %.2f\n", AIC(midas_adl)))
+```
+
+------------------------------------------------------------------------
+
+# In-Sample Fit
+
+Before forecasting, let's assess how well the model fits the historical data.
+
+```{r insample_fit}
+fitted_vals <- fitted(midas_almon)
+n_fitted    <- length(fitted_vals)
+
+# Align dates with fitted values (midasr may drop some initial observations)
+dates_fit   <- tail(gdp_dates, n_fitted)
+actual_fit  <- tail(gdp_values, n_fitted)
+
+df_fit <- data.frame(
+  date    = dates_fit,
+  actual  = actual_fit,
+  fitted  = as.numeric(fitted_vals)
+)
+
+ggplot(df_fit, aes(x = date)) +
+  geom_line(aes(y = actual, color = "Actual"),       linewidth = 0.9) +
+  geom_line(aes(y = fitted, color = "MIDAS Fitted"), linewidth = 0.9,
+            linetype = "dashed") +
+  scale_color_manual(values = c("Actual" = "black", "MIDAS Fitted" = "firebrick")) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "gray50") +
+  labs(title = "In-Sample Fit: MIDAS (Exponential Almon)",
+       subtitle = "U.S. GDP Growth — Actual vs. Fitted",
+       x = NULL, y = "GDP Growth (annualized %)", color = "") +
+  theme_minimal(base_size = 13)
+```
+
+```{r insample_metrics}
+rmse_is <- sqrt(mean((df_fit$actual - df_fit$fitted)^2))
+mae_is  <- mean(abs(df_fit$actual - df_fit$fitted))
+r2_is   <- 1 - sum((df_fit$actual - df_fit$fitted)^2) /
+               sum((df_fit$actual - mean(df_fit$actual))^2)
+
+cat("=== In-Sample Fit Metrics ===\n\n")
+cat(sprintf("RMSE:  %.4f percentage points\n", rmse_is))
+cat(sprintf("MAE:   %.4f percentage points\n", mae_is))
+cat(sprintf("R²:    %.4f\n", r2_is))
+```
+
+> **Note:** Good in-sample fit does not guarantee good out-of-sample forecasts. The real test is how the model performs on data it has never seen. We do that next.
+
+------------------------------------------------------------------------
+
+# Out-of-Sample Forecast Evaluation
+
+## Setting Up the Pseudo-Out-of-Sample Exercise
+
+We split the sample into:
+
+-   **Training set:** 2000 Q1 – 2014 Q4 (used to estimate the model)
+-   **Test set:** 2015 Q1 – end of sample (used to evaluate forecasts)
+
+We then generate **one-step-ahead forecasts** and compare them to the actual GDP growth realizations.
+
+```{r oos_setup}
+# Find the index corresponding to 2015 Q1
+train_end_date <- as.Date("2015-01-01")
+train_idx      <- which(gdp_dates < train_end_date)
+test_idx       <- which(gdp_dates >= train_end_date)
+
+train_end <- max(train_idx)
+n_test    <- length(test_idx)
+
+cat(sprintf("Training period: %s – %s (%d quarters)\n",
+            gdp_dates[1], gdp_dates[train_end], train_end))
+cat(sprintf("Test period:     %s – %s (%d quarters)\n",
+            gdp_dates[test_idx[1]],
+            gdp_dates[test_idx[n_test]],
+            n_test))
+```
+
+```{r oos_forecast}
+# Estimate MIDAS on training data
+y_train   <- gdp_values[train_idx]
+X_train   <- X_hf[1:3720]
+
+midas_oos <- midas_r(
+  y_train ~ mls(X_train, 1:m, 62, nealmon),
+  start = list(X_train = c(0, 0, 0))
+)
+
+# AR(2) benchmark estimated on same training data
+ar2_fit <- Arima(y_train, order = c(2, 0, 0))
+
+# --- Generate forecasts for the test period ---
+# For MIDAS: use the estimated weights + test-period high-frequency data
+# We use a fixed-window approach (re-estimate only once on the training sample)
+theta_oos <- coef(midas_oos)[c("X_train2", "X_train3")]
+b0_oos    <- coef(midas_oos)["(Intercept)"]
+b1_oos    <- coef(midas_oos)["X_train1"]
+w_oos     <- nealmon(theta_oos, m)
+
+midas_fc  <- numeric(n_test)
+for (h in 1:n_test) {
+  midas_fc[h] <- b0_oos + b1_oos * sum(X_hf[test_idx[h]] * w_oos)
+}
+
+# AR(2) forecasts
+ar2_fc <- numeric(n_test)
+y_hist <- y_train
+for (h in 1:n_test) {
+  ar2_fc[h]  <- as.numeric(forecast(Arima(y_hist, order = c(2, 0, 0)),
+                                     h = 1)$mean)
+  y_hist <- c(y_hist, gdp_values[test_idx[h]])  # expand window
+}
+
+# Actuals
+y_test <- gdp_values[test_idx]
+```
+
+```{r oos_metrics}
+msfe_midas <- mean((y_test - midas_fc)^2)
+msfe_ar2   <- mean((y_test - ar2_fc)^2)
+mae_midas  <- mean(abs(y_test - midas_fc))
+mae_ar2    <- mean(abs(y_test - ar2_fc))
+
+cat("=== Out-of-Sample Forecast Evaluation ===\n")
+cat(sprintf("Test period: %s – %s (%d quarters)\n\n",
+            gdp_dates[test_idx[1]],
+            gdp_dates[test_idx[n_test]],
+            n_test))
+cat(sprintf("%-30s  MSFE = %7.4f  MAE = %7.4f\n",
+            "MIDAS (Exponential Almon)", msfe_midas, mae_midas))
+cat(sprintf("%-30s  MSFE = %7.4f  MAE = %7.4f\n",
+            "AR(2) benchmark",           msfe_ar2,   mae_ar2))
+cat(sprintf("\nRelative MSFE (MIDAS / AR2): %.4f\n", msfe_midas / msfe_ar2))
+cat("\n")
+if (msfe_midas < msfe_ar2) {
+  cat("MIDAS outperforms AR(2): Relative MSFE < 1.\n")
+  cat("The high-frequency S&P 500 information improves forecast accuracy.\n")
+} else {
+  cat("AR(2) outperforms MIDAS: Relative MSFE > 1.\n")
+  cat("In this test window, the past GDP dynamics alone forecast better.\n")
+  cat("This is not unusual — stock returns are noisy predictors of GDP in calm periods.\n")
+}
+```
+
