@@ -1,0 +1,380 @@
+---
+title: 'Lab Session: Vector Autoregression (VAR) and Structural VAR (SVAR)'
+author: "Econometrics Lab"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  fig.align = "center"
+)
+```
+
+# Introduction
+
+## What Is a VAR?
+
+A **Vector Autoregression (VAR)** is a system of equations where each variable is regressed on its own lags and the lags of all other variables in the system. It generalizes the univariate AR model to a multivariate setting.
+
+For a bivariate VAR(1) with variables $y_t$ and $x_t$:
+
+$$
+\begin{aligned}
+y_t &= c_1 + a_{11} y_{t-1} + a_{12} x_{t-1} + u_{1t} \\
+x_t &= c_2 + a_{21} y_{t-1} + a_{22} x_{t-1} + u_{2t}
+\end{aligned}
+$$
+
+In matrix form: $\mathbf{Y}_t = \mathbf{c} + \mathbf{A}_1 \mathbf{Y}_{t-1} + \mathbf{u}_t$
+
+**Key features:**
+
+-   Every variable is endogenous
+-   No contemporaneous terms on the RHS (only lags)
+-   The error terms $u_t$ may be correlated across equations
+
+## Why VAR?
+
+-   Captures dynamic interdependencies among multiple time series
+-   Useful for forecasting, Granger causality testing, and impulse response analysis
+-   Minimal structural assumptions required
+
+## Reduced-Form vs. Structural
+
+|   | Reduced-Form VAR | Structural VAR (SVAR) |
+|------------------------|------------------------|------------------------|
+| **Contemporaneous effects** | Hidden in error covariance | Explicitly modeled |
+| **Errors** | Correlated ($\Sigma_u$) | Orthogonal structural shocks ($\varepsilon_t$) |
+| **Identification** | Not needed | Requires restrictions |
+| **Impulse responses** | Not structurally interpretable | Economically meaningful |
+
+------------------------------------------------------------------------
+
+# Setup: Packages and Data
+
+```{r packages}
+# Install packages if needed (uncomment the lines below on first run)
+# install.packages(c("vars", "svars", "urca", "tidyverse", "tseries", "lmtest"))
+
+library(vars)       # VAR estimation and tools
+library(svars)      # Structural VAR identification
+library(urca)       # Unit root / cointegration tests
+library(tseries)    # Additional time series tests
+library(lmtest)     # Granger causality
+library(tidyverse)  # Data manipulation and plotting
+```
+
+## Load the Data
+
+We use the **Canada** dataset built into the `vars` package. It contains four quarterly macroeconomic time series for Canada (1980Q1–2000Q4):
+
+-   `e` — Employment
+-   `prod` — Labor productivity
+-   `rw` — Real wage
+-   `U` — Unemployment rate
+
+```{r load-data}
+data("Canada")
+
+# Inspect the data
+cat("Class:", class(Canada), "\n")
+cat("Dimensions:", dim(Canada), "\n")
+cat("Time range:", start(Canada), "to", end(Canada), "\n\n")
+
+head(Canada)
+```
+
+## Visualize the Series
+
+Always plot your data before modeling!
+
+```{r plot-data}
+# Convert to data frame for ggplot
+canada_df <- data.frame(
+  date = as.Date(time(Canada)),
+  as.data.frame(Canada)
+)
+
+canada_long <- canada_df %>%
+  pivot_longer(cols = -date, names_to = "variable", values_to = "value")
+
+ggplot(canada_long, aes(x = date, y = value)) +
+  geom_line(color = "steelblue", linewidth = 0.8) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 2) +
+  labs(title = "Canadian Macroeconomic Variables (1980Q1 – 2000Q4)",
+       x = "Date", y = "Value") +
+  theme_minimal(base_size = 13)
+```
+
+> **Discussion:** Do the series look stationary? Which ones appear to have trends or unit roots?
+
+------------------------------------------------------------------------
+
+# Preliminary Analysis
+
+## Unit Root Tests
+
+Before estimating a VAR, we need to determine the order of integration for each series.
+
+```{r unit-root}
+# ADF test for each variable
+cat("=== Augmented Dickey-Fuller Tests ===\n")
+cat("H0: The series has a unit root (non-stationary)\n\n")
+
+for (var_name in colnames(Canada)) {
+  adf_result <- adf.test(Canada[, var_name])
+  cat(sprintf("%-6s: ADF stat = %6.3f, p-value = %.4f  %s\n",
+              var_name, adf_result$statistic, adf_result$p.value,
+              ifelse(adf_result$p.value < 0.05, "[STATIONARY]", "[NON-STATIONARY]")))
+}
+```
+
+> **Interpretation:** If a series is non-stationary (fail to reject H0), we might consider:
+>
+> 1.  Differencing the data and estimating a VAR in differences
+> 2.  Estimating a VAR in levels (valid if the VAR is stable — see Lütkepohl 2005)
+> 3.  Using a VECM if cointegration is present
+>
+> For this lab, we proceed with the data **in levels**, which is a common practice in applied macro when the focus is impulse responses.
+
+------------------------------------------------------------------------
+
+# VAR Estimation
+
+## Step 1: Lag Order Selection
+
+Choosing the right number of lags is critical. Too few → omitted dynamics and autocorrelated residuals. Too many → loss of degrees of freedom and overfitting.
+
+```{r lag-selection}
+# VARselect tests up to lag p_max
+lag_select <- VARselect(Canada, lag.max = 8, type = "const")
+
+cat("=== Information Criteria by Lag Order ===\n\n")
+print(lag_select$selection)
+
+cat("\n--- Full IC Table ---\n")
+print(round(lag_select$criteria, 2))
+```
+
+The most commonly used criteria:
+
+-   **AIC** (Akaike): Tends to choose more lags — good for capturing dynamics
+-   **SC/BIC** (Schwarz/Bayesian): Penalizes more heavily — parsimonious models
+-   **HQ** (Hannan-Quinn): A middle ground
+
+## Step 2: Estimate the VAR
+
+```{r estimate-var}
+# Estimate VAR with the lag order chosen by BIC
+p_bic <- lag_select$selection["SC(n)"]
+cat("Selected lag order (BIC):", p_bic, "\n\n")
+
+var_model <- VAR(Canada, p = p_bic, type = "const")
+
+# Summary of one equation (e.g., the Employment equation)
+cat("=== Employment Equation ===\n")
+summary(var_model$varresult$e)
+```
+
+## Understanding the Output
+
+```{r var-coefficients}
+# Extract all coefficient matrices
+cat("=== VAR Coefficient Matrices ===\n\n")
+
+# For each lag, show the A matrix
+for (i in 1:p_bic) {
+  cat(sprintf("--- A_%d (Lag %d coefficients) ---\n", i, i))
+  # Extract coefficients for lag i
+  coef_matrix <- sapply(var_model$varresult, function(eq) {
+    coefs <- coef(eq)
+    # Get coefficients for this lag (variable names end in .li)
+    lag_pattern <- paste0("\\.l", i, "$")
+    coefs[grep(lag_pattern, names(coefs))]
+  })
+  print(round(coef_matrix, 4))
+  cat("\n")
+}
+
+# Residual covariance matrix (this is the key object linking VAR to SVAR)
+cat("--- Residual Covariance Matrix (Sigma_u) ---\n")
+print(round(summary(var_model)$covres, 6))
+
+cat("\n--- Residual Correlation Matrix ---\n")
+print(round(summary(var_model)$corres, 4))
+```
+
+> **Key insight:** The off-diagonal elements in the correlation matrix tell us how much the reduced-form shocks co-move. If they are large, ordering matters a lot for impulse responses!
+
+------------------------------------------------------------------------
+
+# Diagnostic Checks
+
+A well-specified VAR should have residuals that are approximately white noise.
+
+## Serial Correlation Test
+
+```{r serial-corr}
+# Portmanteau test (multivariate Ljung-Box)
+serial_test <- serial.test(var_model, lags.pt = 16, type = "PT.asymptotic")
+
+cat("=== Portmanteau Test for Serial Correlation ===\n")
+cat("H0: No serial correlation up to lag 16\n")
+cat(sprintf("Chi-sq = %.3f, df = %d, p-value = %.4f\n",
+            serial_test$serial$statistic,
+            serial_test$serial$parameter,
+            serial_test$serial$p.value))
+cat(ifelse(serial_test$serial$p.value > 0.05,
+           "=> Fail to reject H0: No evidence of serial correlation.\n",
+           "=> Reject H0: Serial correlation detected! Consider adding more lags.\n"))
+```
+
+## Stability Check
+
+The VAR is stable (stationary) if all eigenvalues of the companion matrix lie inside the unit circle.
+
+```{r stability}
+# Check stability
+roots_var <- roots(var_model)
+
+cat("=== Stability Check ===\n")
+cat("Eigenvalue moduli of companion matrix:\n")
+print(round(roots_var, 4))
+cat(sprintf("\nMax modulus: %.4f\n", max(roots_var)))
+cat(ifelse(all(roots_var < 1),
+           "=> All roots inside unit circle: VAR is STABLE.\n",
+           "=> WARNING: Roots outside unit circle — VAR is NOT stable!\n"))
+```
+
+# Granger Causality
+
+Granger causality tests whether lags of one variable help predict another, beyond the latter's own lags.
+
+**Formally:** $x$ Granger-causes $y$ if past values of $x$ contain information useful for predicting $y$, beyond what is contained in past values of $y$ alone.
+
+```{r granger}
+cat("=== Granger Causality Tests ===\n")
+cat("H0: [column variable] does NOT Granger-cause [row variable]\n\n")
+
+vars_list <- colnames(Canada)
+
+# Create a summary table
+granger_results <- data.frame(
+  Cause = character(),
+  Effect = character(),
+  F_stat = numeric(),
+  p_value = numeric(),
+  Conclusion = character(),
+  stringsAsFactors = FALSE
+)
+
+for (cause_var in vars_list) {
+  gc <- causality(var_model, cause = cause_var)
+  # The test is: cause_var Granger-causes the remaining variables
+  f_val <- gc$Granger$statistic
+  p_val <- gc$Granger$p.value
+  cat(sprintf("%s => {others}: F = %.3f, p = %.4f  %s\n",
+              cause_var, f_val, p_val,
+              ifelse(p_val < 0.05, "[SIGNIFICANT]", "[not significant]")))
+}
+```
+
+> **Caution:** Granger causality ≠ true causality. It only measures predictive content. A variable can Granger-cause another due to a common omitted driver.
+
+------------------------------------------------------------------------
+
+# Impulse Response Functions (IRFs)
+
+## Reduced-Form (Cholesky) IRFs
+
+The most common approach uses a **Cholesky decomposition** of the residual covariance matrix. This imposes a recursive (triangular) ordering: the first variable is not contemporaneously affected by shocks to any other variable; the second is affected only by the first, and so on.
+
+**The ordering matters!** Variables ordered first are treated as more "exogenous."
+
+```{r irf-cholesky}
+# Default ordering: e, prod, rw, U (as they appear in the data)
+cat("Variable ordering:", paste(colnames(Canada), collapse = " -> "), "\n")
+cat("Interpretation: e is most exogenous, U is most endogenous\n\n")
+
+# IRF: shock to productivity -> all variables
+irf_prod <- irf(var_model,
+                impulse = "prod",
+                response = c("e", "prod", "rw", "U"),
+                n.ahead = 20,
+                boot = TRUE,
+                ci = 0.95,
+                runs = 500)
+
+plot(irf_prod, main = "Impulse Responses to a Productivity Shock (Cholesky)")
+```
+
+```{r irf-employment}
+# IRF: shock to employment -> all variables
+irf_e <- irf(var_model,
+             impulse = "e",
+             response = c("e", "prod", "rw", "U"),
+             n.ahead = 20,
+             boot = TRUE,
+             ci = 0.95,
+             runs = 500)
+
+plot(irf_e, main = "Impulse Responses to an Employment Shock (Cholesky)")
+```
+
+## How Sensitive Is the Ordering?
+
+Let's compare two different orderings to see if the results change materially.
+
+```{r ordering-comparison}
+# Ordering 1: e, prod, rw, U (original)
+var_order1 <- VAR(Canada[, c("e", "prod", "rw", "U")], p = p_bic, type = "const")
+
+# Ordering 2: U, rw, prod, e (reversed)
+var_order2 <- VAR(Canada[, c("U", "rw", "prod", "e")], p = p_bic, type = "const")
+
+irf1 <- irf(var_order1, impulse = "prod", response = "e", n.ahead = 20,
+            boot = TRUE, runs = 500)
+irf2 <- irf(var_order2, impulse = "prod", response = "e", n.ahead = 20,
+            boot = TRUE, runs = 500)
+
+# Compare
+par(mfrow = c(1, 2))
+plot(irf1, main = "Order: e → prod → rw → U")
+plot(irf2, main = "Order: U → rw → prod → e")
+par(mfrow = c(1, 1))
+```
+
+> **Takeaway:** If results change substantially with ordering, you should use a **Structural VAR** with theory-motivated identification instead of relying on arbitrary Cholesky orderings.
+
+------------------------------------------------------------------------
+
+# Forecasting with VAR
+
+```{r forecast}
+# Generate forecasts
+var_forecast <- predict(var_model, n.ahead = 8, ci = 0.95)
+
+# Numerical forecast for employment
+cat("=== 8-Quarter Ahead Forecast for Employment ===\n")
+print(round(var_forecast$fcst$e, 3))
+```
+
+------------------------------------------------------------------------
